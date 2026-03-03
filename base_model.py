@@ -54,12 +54,25 @@ class DailyBatchSamplerRandom(Sampler):
 
 
 class SequenceModel():
-    def __init__(self, n_epochs, lr, GPU=None, seed=None, train_stop_loss_thred=None, save_path = 'model/', save_prefix= ''):
+    def __init__(
+        self,
+        n_epochs,
+        lr,
+        GPU=None,
+        seed=None,
+        train_stop_loss_thred=None,
+        save_path="model/",
+        save_prefix="",
+        feature_denoiser=None,
+    ):
         self.n_epochs = n_epochs
         self.lr = lr
         self.device = torch.device(f"cuda:{GPU}" if torch.cuda.is_available() else "cpu")
         self.seed = seed
         self.train_stop_loss_thred = train_stop_loss_thred
+        # Optional callable: feature_denoiser(feature: torch.Tensor[N,T,F]) -> torch.Tensor[N,T,F]
+        # Recommended to run on CPU before moving tensors to GPU.
+        self.feature_denoiser = feature_denoiser
 
         if self.seed is not None:
             np.random.seed(self.seed)
@@ -101,8 +114,9 @@ class SequenceModel():
             T - length of lookback_window, 8
             F - 158 factors + 63 market information + 1 label           
             '''
-            feature = data[:, :, 0:-1].to(self.device)
-            label = data[:, -1, -1].to(self.device)
+            # Keep on CPU first so masking + optional denoising won't run into device mismatch.
+            feature = data[:, :, 0:-1]
+            label = data[:, -1, -1]
 
             
             # 对raw data删除极端标签
@@ -111,6 +125,13 @@ class SequenceModel():
             feature = feature[mask, :, :]
             label = zscore(label) # CSZscoreNorm
             #########################
+
+            # Optional wavelet denoising (or any feature preprocessor)
+            if self.feature_denoiser is not None:
+                feature = self.feature_denoiser(feature)
+
+            feature = feature.to(self.device)
+            label = label.to(self.device)
 
             pred = self.model(feature.float())
             loss = self.loss_fn(pred, label)
@@ -129,11 +150,18 @@ class SequenceModel():
 
         for data in data_loader:
             data = torch.squeeze(data, dim=0)
-            feature = data[:, :, 0:-1].to(self.device)
-            label = data[:, -1, -1].to(self.device)
+            feature = data[:, :, 0:-1]
+            label = data[:, -1, -1]
 
             mask, label = drop_na(label)
             label = zscore(label)
+
+            if self.feature_denoiser is not None:
+                feature = self.feature_denoiser(feature)
+
+            feature = feature.to(self.device)
+            label = label.to(self.device)
+            mask = mask.to(self.device)
                         
             pred = self.model(feature.float())
             loss = self.loss_fn(pred[mask], label)
@@ -182,11 +210,16 @@ class SequenceModel():
         self.model.eval()
         for data in test_loader:
             data = torch.squeeze(data, dim=0)
-            feature = data[:, :, 0:-1].to(self.device)
+            feature = data[:, :, 0:-1]
             label = data[:, -1, -1]
             
             # nan label will be automatically ignored when compute metrics.
             # zscorenorm will not affect the results of ranking-based metrics.
+
+            if self.feature_denoiser is not None:
+                feature = self.feature_denoiser(feature)
+
+            feature = feature.to(self.device)
 
             with torch.no_grad():
                 pred = self.model(feature.float()).detach().cpu().numpy()

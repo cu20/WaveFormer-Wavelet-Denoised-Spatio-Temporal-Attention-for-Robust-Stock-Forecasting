@@ -3,6 +3,7 @@ import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 from WaveFormer import WaveFormerModel
+from wavelet_denoise import WaveletDenoiser
 import pickle
 import numpy as np
 import time
@@ -50,11 +51,23 @@ ricir = []
 
 # Training
 ######################################################################################
-for seed in [0, 1, 2, 3, 4]:
+for seed in [0]:
+    # Optional: enable wavelet denoising on factor features (0:158), skip market info (158:221)
+    # If you don't want it, set feature_denoiser=None
+    feature_denoiser = WaveletDenoiser(
+        enabled=True,          # <- set True to enable
+        wavelet="db8",
+        level=None,             # auto level (up to 3)
+        threshold_mode="soft",
+        threshold_scale=1.0,
+        feature_start=0,
+        feature_end=158,
+    )
     model = WaveFormerModel(
         d_feat = d_feat, d_model = d_model, t_nhead = t_nhead, s_nhead = s_nhead, T_dropout_rate=dropout, S_dropout_rate=dropout,
         beta=beta, gate_input_end_index=gate_input_end_index, gate_input_start_index=gate_input_start_index,
         n_epochs=n_epoch, lr = lr, GPU = GPU, seed = seed, train_stop_loss_thred = train_stop_loss_thred,
+        feature_denoiser=feature_denoiser,
         save_path='model', save_prefix=f'{universe}_{prefix}'
     )
 
