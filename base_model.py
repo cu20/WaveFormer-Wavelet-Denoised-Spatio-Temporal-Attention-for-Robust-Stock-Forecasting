@@ -2,41 +2,50 @@ import numpy as np
 import pandas as pd
 import copy
 
-from torch.utils.data import DataLoader
-from torch.utils.data import Sampler
+from torch.utils.data import DataLoader, Sampler
 import torch
 import torch.optim as optim
 
+
 def calc_ic(pred, label):
-    df = pd.DataFrame({'pred':pred, 'label':label})
-    ic = df['pred'].corr(df['label'])
-    ric = df['pred'].corr(df['label'], method='spearman')
+    df = pd.DataFrame({"pred": pred, "label": label})
+    ic = df["pred"].corr(df["label"])
+    ric = df["pred"].corr(df["label"], method="spearman")
     return ic, ric
+
 
 def zscore(x):
     return (x - x.mean()).div(x.std())
 
+
 def drop_extreme(x):
     sorted_tensor, indices = x.sort()
     N = x.shape[0]
-    percent_2_5 = int(0.025*N)  
-    # Exclude top 2.5% and bottom 2.5% values
+    percent_2_5 = int(0.025 * N)
     filtered_indices = indices[percent_2_5:-percent_2_5]
     mask = torch.zeros_like(x, device=x.device, dtype=torch.bool)
     mask[filtered_indices] = True
     return mask, x[mask]
 
+
 def drop_na(x):
     mask = ~x.isnan()
     return mask, x[mask]
 
+
 class DailyBatchSamplerRandom(Sampler):
+    """Groups samples by date so each batch contains all stocks for one day."""
+
     def __init__(self, data_source, shuffle=False):
         self.data_source = data_source
         self.shuffle = shuffle
-        # calculate number of samples in each batch
-        self.daily_count = pd.Series(index=self.data_source.get_index()).groupby("datetime").size().values
-        self.daily_index = np.roll(np.cumsum(self.daily_count), 1)  # calculate begin index of each batch
+        self.daily_count = (
+            pd.Series(index=self.data_source.get_index())
+            .groupby("datetime")
+            .size()
+            .values
+        )
+        self.daily_index = np.roll(np.cumsum(self.daily_count), 1)
         self.daily_index[0] = 0
 
     def __iter__(self):
@@ -53,53 +62,44 @@ class DailyBatchSamplerRandom(Sampler):
         return len(self.data_source)
 
 
-class SequenceModel():
+class SequenceModel:
     def __init__(
         self,
-        n_epochs,
-        lr,
+        n_epochs: int,
+        lr: float,
         GPU=None,
         seed=None,
         train_stop_loss_thred=None,
-        save_path="model/",
-        save_prefix="",
-        feature_denoiser=None,
+        save_path: str = "model/",
+        save_prefix: str = "",
     ):
         self.n_epochs = n_epochs
         self.lr = lr
         self.device = torch.device(f"cuda:{GPU}" if torch.cuda.is_available() else "cpu")
         self.seed = seed
         self.train_stop_loss_thred = train_stop_loss_thred
-        # Optional callable: feature_denoiser(feature: torch.Tensor[N,T,F]) -> torch.Tensor[N,T,F]
-        # Recommended to run on CPU before moving tensors to GPU.
-        self.feature_denoiser = feature_denoiser
 
         if self.seed is not None:
             np.random.seed(self.seed)
             torch.manual_seed(self.seed)
             torch.cuda.manual_seed_all(self.seed)
             torch.backends.cudnn.deterministic = True
-        self.fitted = -1
 
+        self.fitted = -1
         self.model = None
         self.train_optimizer = None
-
         self.save_path = save_path
         self.save_prefix = save_prefix
-
 
     def init_model(self):
         if self.model is None:
             raise ValueError("模型未初始化")
-
         self.train_optimizer = optim.Adam(self.model.parameters(), self.lr)
         self.model.to(self.device)
 
     def loss_fn(self, pred, label):
-        # mask 用来排除nan值
         mask = ~torch.isnan(label)
-        # 计算预测值和真实值的平方差
-        loss = (pred[mask]-label[mask])**2
+        loss = (pred[mask] - label[mask]) ** 2
         return torch.mean(loss)
 
     def train_epoch(self, data_loader):
@@ -108,27 +108,14 @@ class SequenceModel():
 
         for data in data_loader:
             data = torch.squeeze(data, dim=0)
-            '''
-            data.shape: (N, T, F)
-            N - number of stocks
-            T - length of lookback_window, 8
-            F - 158 factors + 63 market information + 1 label           
-            '''
-            # Keep on CPU first so masking + optional denoising won't run into device mismatch.
+            # data: (N, T, F)  where F = features + 1 label column
             feature = data[:, :, 0:-1]
             label = data[:, -1, -1]
 
-            
-            # 对raw data删除极端标签
-            #########################
+            # Remove extreme label values and z-score normalise
             mask, label = drop_extreme(label)
             feature = feature[mask, :, :]
-            label = zscore(label) # CSZscoreNorm
-            #########################
-
-            # Optional wavelet denoising (or any feature preprocessor)
-            if self.feature_denoiser is not None:
-                feature = self.feature_denoiser(feature)
+            label = zscore(label)
 
             feature = feature.to(self.device)
             label = label.to(self.device)
@@ -156,22 +143,28 @@ class SequenceModel():
             mask, label = drop_na(label)
             label = zscore(label)
 
-            if self.feature_denoiser is not None:
-                feature = self.feature_denoiser(feature)
-
             feature = feature.to(self.device)
             label = label.to(self.device)
             mask = mask.to(self.device)
-                        
-            pred = self.model(feature.float())
+
+            with torch.no_grad():
+                pred = self.model(feature.float())
             loss = self.loss_fn(pred[mask], label)
             losses.append(loss.item())
 
         return float(np.mean(losses))
-    
+
     def _init_data_loader(self, data, shuffle=True, drop_last=True):
         sampler = DailyBatchSamplerRandom(data, shuffle)
-        data_loader = DataLoader(data, sampler=sampler, drop_last=drop_last)
+        # pin_memory=True enables DMA async transfer, reducing CPU-GPU latency
+        use_pin = self.device.type == "cuda"
+        data_loader = DataLoader(
+            data,
+            sampler=sampler,
+            drop_last=drop_last,
+            pin_memory=use_pin,
+            num_workers=0,
+        )
         return data_loader
 
     def load_param(self, param_path):
@@ -181,25 +174,32 @@ class SequenceModel():
     def fit(self, dl_train, dl_valid=None):
         train_loader = self._init_data_loader(dl_train, shuffle=True, drop_last=True)
         best_param = None
+
         for step in range(self.n_epochs):
             train_loss = self.train_epoch(train_loader)
             self.fitted = step
+
             if dl_valid:
                 predictions, metrics = self.predict(dl_valid)
-                print("Epoch %d, train_loss %.6f, valid ic %.4f, icir %.3f, rankic %.4f, rankicir %.3f." % (step, train_loss, metrics['IC'],  metrics['ICIR'],  metrics['RIC'],  metrics['RICIR']))
-            else: print("Epoch %d, train_loss %.6f" % (step, train_loss))
-        
-            if train_loss <= self.train_stop_loss_thred:
+                print(
+                    "Epoch %d, train_loss %.6f, valid ic %.4f, icir %.3f, rankic %.4f, rankicir %.3f."
+                    % (step, train_loss, metrics["IC"], metrics["ICIR"], metrics["RIC"], metrics["RICIR"])
+                )
+            else:
+                print("Epoch %d, train_loss %.6f" % (step, train_loss))
+
+            if self.train_stop_loss_thred is not None and train_loss <= self.train_stop_loss_thred:
                 best_param = copy.deepcopy(self.model.state_dict())
-                torch.save(best_param, f'{self.save_path}/{self.save_prefix}_{self.seed}.pkl')
+                import os
+                os.makedirs(self.save_path, exist_ok=True)
+                torch.save(best_param, f"{self.save_path}/{self.save_prefix}_{self.seed}.pkl")
                 break
-        
 
     def predict(self, dl_test):
         if self.fitted < 0:
             raise ValueError("模型还未训练!")
         else:
-            print('Epoch:', self.fitted)
+            print("Epoch:", self.fitted)
 
         test_loader = self._init_data_loader(dl_test, shuffle=False, drop_last=False)
 
@@ -212,12 +212,6 @@ class SequenceModel():
             data = torch.squeeze(data, dim=0)
             feature = data[:, :, 0:-1]
             label = data[:, -1, -1]
-            
-            # nan label will be automatically ignored when compute metrics.
-            # zscorenorm will not affect the results of ranking-based metrics.
-
-            if self.feature_denoiser is not None:
-                feature = self.feature_denoiser(feature)
 
             feature = feature.to(self.device)
 
@@ -232,10 +226,15 @@ class SequenceModel():
         predictions = pd.Series(np.concatenate(preds), index=dl_test.get_index())
 
         metrics = {
-            'IC': np.mean(ic),
-            'ICIR': np.mean(ic)/np.std(ic),
-            'RIC': np.mean(ric),
-            'RICIR': np.mean(ric)/np.std(ric)
+            "IC": np.mean(ic),
+            "ICIR": np.mean(ic) / np.std(ic),
+            "RIC": np.mean(ric),
+            "RICIR": np.mean(ric) / np.std(ric),
         }
 
+        # Print IC summary automatically
+        print(
+            f"  IC={metrics['IC']:.4f}  ICIR={metrics['ICIR']:.3f}"
+            f"  RIC={metrics['RIC']:.4f}  RICIR={metrics['RICIR']:.3f}"
+        )
         return predictions, metrics

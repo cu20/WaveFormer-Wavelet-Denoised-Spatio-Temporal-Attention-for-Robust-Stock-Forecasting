@@ -4,8 +4,10 @@ from torch.nn.modules.linear import Linear
 from torch.nn.modules.dropout import Dropout
 from torch.nn.modules.normalization import LayerNorm
 import math
+from typing import Optional
 
 from base_model import SequenceModel
+from wavelet_gpu import GpuWaveletDenoiser
 
 
 class PositionalEncoding(nn.Module):
@@ -39,10 +41,7 @@ class SAttention(nn.Module):
             attn_dropout_layer.append(Dropout(p=dropout))
         self.attn_dropout = nn.ModuleList(attn_dropout_layer)
 
-        # input LayerNorm
         self.norm1 = LayerNorm(d_model, eps=1e-5)
-
-        # FFN layerNorm
         self.norm2 = LayerNorm(d_model, eps=1e-5)
         self.ffn = nn.Sequential(
             Linear(d_model, d_model),
@@ -54,14 +53,14 @@ class SAttention(nn.Module):
 
     def forward(self, x):
         x = self.norm1(x)
-        q = self.qtrans(x).transpose(0,1)
-        k = self.ktrans(x).transpose(0,1)
-        v = self.vtrans(x).transpose(0,1)
+        q = self.qtrans(x).transpose(0, 1)
+        k = self.ktrans(x).transpose(0, 1)
+        v = self.vtrans(x).transpose(0, 1)
 
-        dim = int(self.d_model/self.nhead)
+        dim = int(self.d_model / self.nhead)
         att_output = []
         for i in range(self.nhead):
-            if i==self.nhead-1:
+            if i == self.nhead - 1:
                 qh = q[:, :, i * dim:]
                 kh = k[:, :, i * dim:]
                 vh = v[:, :, i * dim:]
@@ -70,18 +69,17 @@ class SAttention(nn.Module):
                 kh = k[:, :, i * dim:(i + 1) * dim]
                 vh = v[:, :, i * dim:(i + 1) * dim]
 
-            atten_ave_matrixh = torch.softmax(torch.matmul(qh, kh.transpose(1, 2)) / self.temperature, dim=-1)
+            atten_ave_matrixh = torch.softmax(
+                torch.matmul(qh, kh.transpose(1, 2)) / self.temperature, dim=-1
+            )
             if self.attn_dropout:
                 atten_ave_matrixh = self.attn_dropout[i](atten_ave_matrixh)
             att_output.append(torch.matmul(atten_ave_matrixh, vh).transpose(0, 1))
         att_output = torch.concat(att_output, dim=-1)
 
-        # FFN
         xt = x + att_output
         xt = self.norm2(xt)
-        att_output = xt + self.ffn(xt)
-
-        return att_output
+        return xt + self.ffn(xt)
 
 
 class TAttention(nn.Module):
@@ -99,11 +97,8 @@ class TAttention(nn.Module):
                 self.attn_dropout.append(Dropout(p=dropout))
             self.attn_dropout = nn.ModuleList(self.attn_dropout)
 
-        # input LayerNorm
         self.norm1 = LayerNorm(d_model, eps=1e-5)
-        # FFN layerNorm
         self.norm2 = LayerNorm(d_model, eps=1e-5)
-        # FFN
         self.ffn = nn.Sequential(
             Linear(d_model, d_model),
             nn.ReLU(),
@@ -121,7 +116,7 @@ class TAttention(nn.Module):
         dim = int(self.d_model / self.nhead)
         att_output = []
         for i in range(self.nhead):
-            if i==self.nhead-1:
+            if i == self.nhead - 1:
                 qh = q[:, :, i * dim:]
                 kh = k[:, :, i * dim:]
                 vh = v[:, :, i * dim:]
@@ -129,31 +124,30 @@ class TAttention(nn.Module):
                 qh = q[:, :, i * dim:(i + 1) * dim]
                 kh = k[:, :, i * dim:(i + 1) * dim]
                 vh = v[:, :, i * dim:(i + 1) * dim]
-            atten_ave_matrixh = torch.softmax(torch.matmul(qh, kh.transpose(1, 2)), dim=-1)
+            atten_ave_matrixh = torch.softmax(
+                torch.matmul(qh, kh.transpose(1, 2)), dim=-1
+            )
             if self.attn_dropout:
                 atten_ave_matrixh = self.attn_dropout[i](atten_ave_matrixh)
             att_output.append(torch.matmul(atten_ave_matrixh, vh))
         att_output = torch.concat(att_output, dim=-1)
 
-        # FFN
         xt = x + att_output
         xt = self.norm2(xt)
-        att_output = xt + self.ffn(xt)
-
-        return att_output
+        return xt + self.ffn(xt)
 
 
 class Gate(nn.Module):
-    def __init__(self, d_input, d_output,  beta=1.0):
+    def __init__(self, d_input, d_output, beta=1.0):
         super().__init__()
         self.trans = nn.Linear(d_input, d_output)
-        self.d_output =d_output
+        self.d_output = d_output
         self.t = beta
 
     def forward(self, gate_input):
         output = self.trans(gate_input)
-        output = torch.softmax(output/self.t, dim=-1)
-        return self.d_output*output
+        output = torch.softmax(output / self.t, dim=-1)
+        return self.d_output * output
 
 
 class TemporalAttention(nn.Module):
@@ -162,69 +156,140 @@ class TemporalAttention(nn.Module):
         self.trans = nn.Linear(d_model, d_model, bias=False)
 
     def forward(self, z):
-        h = self.trans(z) # [N, T, D]
+        h = self.trans(z)                                   # (N, T, D)
         query = h[:, -1, :].unsqueeze(-1)
-        lam = torch.matmul(h, query).squeeze(-1)  # [N, T, D] --> [N, T]
+        lam = torch.matmul(h, query).squeeze(-1)            # (N, T)
         lam = torch.softmax(lam, dim=1).unsqueeze(1)
-        output = torch.matmul(lam, z).squeeze(1)  # [N, 1, T], [N, T, D] --> [N, 1, D]
-        return output
+        return torch.matmul(lam, z).squeeze(1)              # (N, D)
 
 
 class WaveFormer(nn.Module):
-    def __init__(self, d_feat, d_model, t_nhead, s_nhead, T_dropout_rate, S_dropout_rate, gate_input_start_index, gate_input_end_index, beta):
+    """
+    WaveFormer core neural network.
+
+    Architecture (in order):
+      1. [optional] GpuWaveletDenoiser  — denoises factor features on GPU
+      2. Feature Gate                   — market-info guided feature weighting
+      3. Linear projection (d_feat → d_model)
+      4. Positional Encoding
+      5. TAttention                     — intra-stock temporal attention
+      6. SAttention                     — inter-stock cross-sectional attention
+      7. TemporalAttention              — temporal aggregation
+      8. Linear (d_model → 1)
+    """
+
+    def __init__(
+        self,
+        d_feat: int,
+        d_model: int,
+        t_nhead: int,
+        s_nhead: int,
+        T_dropout_rate: float,
+        S_dropout_rate: float,
+        gate_input_start_index: int,
+        gate_input_end_index: int,
+        beta: float,
+        # wavelet denoising
+        use_wavelet_denoise: bool = False,
+        wavelet: str = "haar",
+        denoise_level: Optional[int] = 1,
+        threshold_mode: str = "soft",
+        threshold_scale: float = 0.5,
+    ):
         super(WaveFormer, self).__init__()
-        # market
+
         self.gate_input_start_index = gate_input_start_index
         self.gate_input_end_index = gate_input_end_index
-        self.d_gate_input = (gate_input_end_index - gate_input_start_index) # F'
+        self.d_gate_input = gate_input_end_index - gate_input_start_index
         self.feature_gate = Gate(self.d_gate_input, d_feat, beta=beta)
 
+        # Optional GPU-native wavelet denoising layer (first op in forward)
+        self.wavelet_denoiser: Optional[GpuWaveletDenoiser] = None
+        if use_wavelet_denoise:
+            self.wavelet_denoiser = GpuWaveletDenoiser(
+                wavelet=wavelet,
+                level=denoise_level,
+                threshold_mode=threshold_mode,
+                threshold_scale=threshold_scale,
+                feature_start=0,
+                feature_end=gate_input_start_index,  # only factor features, not market info
+            )
+
         self.layers = nn.Sequential(
-            # feature layer
             nn.Linear(d_feat, d_model),
             PositionalEncoding(d_model),
-            # intra-stock aggregation
             TAttention(d_model=d_model, nhead=t_nhead, dropout=T_dropout_rate),
-            # inter-stock aggregation
             SAttention(d_model=d_model, nhead=s_nhead, dropout=S_dropout_rate),
             TemporalAttention(d_model=d_model),
-            # decoder
-            nn.Linear(d_model, 1)
+            nn.Linear(d_model, 1),
         )
 
-    def forward(self, x):
-        src = x[:, :, :self.gate_input_start_index] # N, T, D
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, T, F_total)  where F_total = d_feat + d_gate_input
+        src = x[:, :, :self.gate_input_start_index]         # (N, T, d_feat)
         gate_input = x[:, -1, self.gate_input_start_index:self.gate_input_end_index]
-        src = src * torch.unsqueeze(self.feature_gate(gate_input), dim=1)
-       
-        output = self.layers(src).squeeze(-1)
 
-        return output
+        # GPU wavelet denoising on factor features (stays on the same device)
+        if self.wavelet_denoiser is not None:
+            src = self.wavelet_denoiser(src)
+
+        src = src * torch.unsqueeze(self.feature_gate(gate_input), dim=1)
+        return self.layers(src).squeeze(-1)
 
 
 class WaveFormerModel(SequenceModel):
     def __init__(
-            self, d_feat, d_model, t_nhead, s_nhead, gate_input_start_index, gate_input_end_index,
-            T_dropout_rate, S_dropout_rate, beta, **kwargs,
+        self,
+        d_feat: int,
+        d_model: int,
+        t_nhead: int,
+        s_nhead: int,
+        gate_input_start_index: int,
+        gate_input_end_index: int,
+        T_dropout_rate: float,
+        S_dropout_rate: float,
+        beta: float,
+        # wavelet denoising (GPU-native, inside the model)
+        use_wavelet_denoise: bool = False,
+        wavelet: str = "haar",
+        denoise_level: Optional[int] = 1,
+        threshold_mode: str = "soft",
+        threshold_scale: float = 0.5,
+        **kwargs,
     ):
         super(WaveFormerModel, self).__init__(**kwargs)
         self.d_model = d_model
         self.d_feat = d_feat
-
         self.gate_input_start_index = gate_input_start_index
         self.gate_input_end_index = gate_input_end_index
-
         self.T_dropout_rate = T_dropout_rate
         self.S_dropout_rate = S_dropout_rate
         self.t_nhead = t_nhead
         self.s_nhead = s_nhead
         self.beta = beta
+        self.use_wavelet_denoise = use_wavelet_denoise
+        self.wavelet = wavelet
+        self.denoise_level = denoise_level
+        self.threshold_mode = threshold_mode
+        self.threshold_scale = threshold_scale
 
         self.init_model()
 
     def init_model(self):
-        self.model = WaveFormer(d_feat=self.d_feat, d_model=self.d_model, t_nhead=self.t_nhead, s_nhead=self.s_nhead,
-                                   T_dropout_rate=self.T_dropout_rate, S_dropout_rate=self.S_dropout_rate,
-                                   gate_input_start_index=self.gate_input_start_index,
-                                   gate_input_end_index=self.gate_input_end_index, beta=self.beta)
+        self.model = WaveFormer(
+            d_feat=self.d_feat,
+            d_model=self.d_model,
+            t_nhead=self.t_nhead,
+            s_nhead=self.s_nhead,
+            T_dropout_rate=self.T_dropout_rate,
+            S_dropout_rate=self.S_dropout_rate,
+            gate_input_start_index=self.gate_input_start_index,
+            gate_input_end_index=self.gate_input_end_index,
+            beta=self.beta,
+            use_wavelet_denoise=self.use_wavelet_denoise,
+            wavelet=self.wavelet,
+            denoise_level=self.denoise_level,
+            threshold_mode=self.threshold_mode,
+            threshold_scale=self.threshold_scale,
+        )
         super(WaveFormerModel, self).init_model()
