@@ -193,8 +193,15 @@ class WaveFormer(nn.Module):
         use_wavelet_denoise: bool = False,
         wavelet: str = "haar",
         denoise_level: Optional[int] = 1,
+        threshold_method: str = "bayes",
         threshold_mode: str = "soft",
-        threshold_scale: float = 0.5,
+        threshold_scale: float = 0.3,
+        denoise_blend: float = 0.25,
+        denoise_finest_only: bool = True,
+        level_dependent_scale: bool = True,
+        use_edge_pad: bool = True,
+        use_boundary_smooth: bool = False,
+        boundary_smooth_win: int = 1,
     ):
         super(WaveFormer, self).__init__()
 
@@ -209,8 +216,15 @@ class WaveFormer(nn.Module):
             self.wavelet_denoiser = GpuWaveletDenoiser(
                 wavelet=wavelet,
                 level=denoise_level,
+                threshold_method=threshold_method,
                 threshold_mode=threshold_mode,
                 threshold_scale=threshold_scale,
+                denoise_blend=denoise_blend,
+                denoise_finest_only=denoise_finest_only,
+                level_dependent_scale=level_dependent_scale,
+                use_edge_pad=use_edge_pad,
+                use_boundary_smooth=use_boundary_smooth,
+                boundary_smooth_win=boundary_smooth_win,
                 feature_start=0,
                 feature_end=gate_input_start_index,  # only factor features, not market info
             )
@@ -253,8 +267,15 @@ class WaveFormerModel(SequenceModel):
         use_wavelet_denoise: bool = False,
         wavelet: str = "haar",
         denoise_level: Optional[int] = 1,
+        threshold_method: str = "bayes",
         threshold_mode: str = "soft",
-        threshold_scale: float = 0.5,
+        threshold_scale: float = 0.3,
+        denoise_blend: float = 0.25,
+        denoise_finest_only: bool = True,
+        level_dependent_scale: bool = True,
+        use_edge_pad: bool = True,
+        use_boundary_smooth: bool = False,
+        boundary_smooth_win: int = 1,
         **kwargs,
     ):
         super(WaveFormerModel, self).__init__(**kwargs)
@@ -270,8 +291,15 @@ class WaveFormerModel(SequenceModel):
         self.use_wavelet_denoise = use_wavelet_denoise
         self.wavelet = wavelet
         self.denoise_level = denoise_level
+        self.threshold_method = threshold_method
         self.threshold_mode = threshold_mode
         self.threshold_scale = threshold_scale
+        self.denoise_blend = denoise_blend
+        self.denoise_finest_only = denoise_finest_only
+        self.level_dependent_scale = level_dependent_scale
+        self.use_edge_pad = use_edge_pad
+        self.use_boundary_smooth = use_boundary_smooth
+        self.boundary_smooth_win = boundary_smooth_win
 
         self.init_model()
 
@@ -289,7 +317,14 @@ class WaveFormerModel(SequenceModel):
             use_wavelet_denoise=self.use_wavelet_denoise,
             wavelet=self.wavelet,
             denoise_level=self.denoise_level,
+            threshold_method=self.threshold_method,
             threshold_mode=self.threshold_mode,
             threshold_scale=self.threshold_scale,
+            denoise_blend=self.denoise_blend,
+            denoise_finest_only=self.denoise_finest_only,
+            level_dependent_scale=self.level_dependent_scale,
+            use_edge_pad=self.use_edge_pad,
+            use_boundary_smooth=self.use_boundary_smooth,
+            boundary_smooth_win=self.boundary_smooth_win,
         )
         super(WaveFormerModel, self).init_model()

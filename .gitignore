@@ -5,7 +5,12 @@ __pycache__/
 
 # C extensions
 *.so
-
+#qlib
+qlib/
+*.tar.gz
+*.tar
+# 文档
+*.docx
 # Distribution / packaging
 .Python
 build/
