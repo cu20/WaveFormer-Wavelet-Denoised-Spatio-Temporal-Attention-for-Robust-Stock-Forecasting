@@ -56,7 +56,7 @@ for seed in [0]:
     # If you don't want it, set feature_denoiser=None
     feature_denoiser = WaveletDenoiser(
         enabled=True,          # <- set True to enable
-        wavelet="db8",
+        wavelet="haar",
         level=None,             # auto level (up to 3)
         threshold_mode="soft",
         threshold_scale=1.0,
