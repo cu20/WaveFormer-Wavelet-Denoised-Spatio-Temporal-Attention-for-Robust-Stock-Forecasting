@@ -82,6 +82,11 @@ class GpuWaveletDenoiser(nn.Module):
     threshold_mode       : 'soft' | 'hard' | 'semisoft'
     threshold_scale      : multiply threshold by this factor. Default 0.3.
     denoise_blend        : output = (1-blend)*raw + blend*denoised. Default 0.25.
+    adaptive_blend       : if True, adapt blend per series based on estimated noise ratio.
+    adaptive_target_ratio: target noise ratio where blend starts increasing.
+    adaptive_sharpness   : sigmoid sharpness for adaptive blend mapping.
+    adaptive_blend_min   : lower bound of effective blend.
+    adaptive_blend_max   : upper bound of effective blend.
     denoise_finest_only  : if True, only threshold finest-level detail coefficients.
     level_dependent_scale: if True, scale for level i = threshold_scale * 0.5^i.
     use_edge_pad         : pad signal to next power-of-2 via edge replication before DWT.
@@ -99,6 +104,11 @@ class GpuWaveletDenoiser(nn.Module):
         threshold_mode: str = "soft",
         threshold_scale: float = 0.3,
         denoise_blend: float = 0.25,
+        adaptive_blend: bool = False,
+        adaptive_target_ratio: float = 0.08,
+        adaptive_sharpness: float = 12.0,
+        adaptive_blend_min: float = 0.03,
+        adaptive_blend_max: float = 0.55,
         denoise_finest_only: bool = True,
         level_dependent_scale: bool = True,
         use_edge_pad: bool = True,
@@ -106,6 +116,7 @@ class GpuWaveletDenoiser(nn.Module):
         boundary_smooth_win: int = 1,
         feature_start: int = 0,
         feature_end: Optional[int] = None,
+        collect_stats: bool = True,
     ):
         super().__init__()
         wavelet = wavelet.lower()
@@ -118,6 +129,11 @@ class GpuWaveletDenoiser(nn.Module):
         self.threshold_mode = threshold_mode
         self.threshold_scale = float(threshold_scale)
         self.denoise_blend = float(denoise_blend)
+        self.adaptive_blend = bool(adaptive_blend)
+        self.adaptive_target_ratio = float(adaptive_target_ratio)
+        self.adaptive_sharpness = float(adaptive_sharpness)
+        self.adaptive_blend_min = float(adaptive_blend_min)
+        self.adaptive_blend_max = float(adaptive_blend_max)
         self.denoise_finest_only = denoise_finest_only
         self.level_dependent_scale = level_dependent_scale
         self.use_edge_pad = use_edge_pad
@@ -125,6 +141,35 @@ class GpuWaveletDenoiser(nn.Module):
         self.boundary_smooth_win = boundary_smooth_win
         self.feature_start = feature_start
         self.feature_end = feature_end
+        self.collect_stats = bool(collect_stats)
+        self._reset_stats()
+
+    def _reset_stats(self) -> None:
+        self._stat_batches = 0
+        self._stat_delta_abs = 0.0
+        self._stat_raw_abs = 0.0
+        self._stat_delta_energy_ratio = 0.0
+        self._stat_eff_blend = 0.0
+        self._stat_noise_ratio = 0.0
+
+    def consume_stats(self, reset: bool = True) -> Optional[dict]:
+        """
+        Return aggregated denoising statistics since last reset.
+        Useful for epoch-level logging in training.
+        """
+        if not self.collect_stats or self._stat_batches <= 0:
+            return None
+        n = float(self._stat_batches)
+        stats = {
+            "delta_abs_mean": self._stat_delta_abs / n,
+            "raw_abs_mean": self._stat_raw_abs / n,
+            "delta_energy_ratio": self._stat_delta_energy_ratio / n,
+            "effective_blend_mean": self._stat_eff_blend / n,
+            "noise_ratio_mean": self._stat_noise_ratio / n,
+        }
+        if reset:
+            self._reset_stats()
+        return stats
 
     def _auto_level(self, t: int) -> int:
         """Max valid level for Haar: T=8 -> level 3."""
@@ -209,6 +254,25 @@ class GpuWaveletDenoiser(nn.Module):
         else:  # semisoft
             return self._semisoft_thresh(x, thr)
 
+    def _compute_effective_blend(self, raw: torch.Tensor, finest_detail: torch.Tensor) -> torch.Tensor:
+        """
+        Compute per-series adaptive blend in shape (B, 1).
+        Higher estimated noise ratio -> stronger blend.
+        """
+        B = raw.shape[0]
+        base = torch.full((B, 1), self.denoise_blend, dtype=raw.dtype, device=raw.device)
+        if not self.adaptive_blend:
+            return base
+
+        noise_power = finest_detail.pow(2).mean(dim=1, keepdim=True)
+        signal_power = raw.pow(2).mean(dim=1, keepdim=True)
+        noise_ratio = noise_power / (signal_power + 1e-12)
+        gate = torch.sigmoid(self.adaptive_sharpness * (noise_ratio - self.adaptive_target_ratio))
+        # Around base blend: low-noise -> weaker denoise; high-noise -> stronger denoise.
+        eff = self.denoise_blend * (0.25 + 1.5 * gate)
+        eff = eff.clamp(min=self.adaptive_blend_min, max=self.adaptive_blend_max)
+        return eff
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -286,7 +350,27 @@ class GpuWaveletDenoiser(nn.Module):
             rec = _savitzky_golay_boundary(rec, self.boundary_smooth_win)
 
         # ---- Residual blend ----
-        out_sig = (1.0 - self.denoise_blend) * raw + self.denoise_blend * rec
+        finest = details[0] if len(details) > 0 else (rec - raw)
+        eff_blend = self._compute_effective_blend(raw, finest)
+        out_sig = (1.0 - eff_blend) * raw + eff_blend * rec
+
+        if self.collect_stats:
+            with torch.no_grad():
+                delta = out_sig - raw
+                raw_abs = raw.abs().mean()
+                delta_abs = delta.abs().mean()
+                energy_ratio = delta.pow(2).mean() / (raw.pow(2).mean() + 1e-12)
+                if len(details) > 0:
+                    noise_ratio = details[0].pow(2).mean() / (raw.pow(2).mean() + 1e-12)
+                else:
+                    noise_ratio = torch.tensor(0.0, dtype=raw.dtype, device=raw.device)
+                eff_blend_mean = eff_blend.mean()
+                self._stat_batches += 1
+                self._stat_raw_abs += float(raw_abs.detach().cpu().item())
+                self._stat_delta_abs += float(delta_abs.detach().cpu().item())
+                self._stat_delta_energy_ratio += float(energy_ratio.detach().cpu().item())
+                self._stat_eff_blend += float(eff_blend_mean.detach().cpu().item())
+                self._stat_noise_ratio += float(noise_ratio.detach().cpu().item())
 
         # (B, T) -> (N, T, F_sub)
         out_sub = out_sig.reshape(N, F_sub, orig_T).permute(0, 2, 1)

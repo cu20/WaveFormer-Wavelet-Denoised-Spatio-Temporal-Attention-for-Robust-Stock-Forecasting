@@ -145,7 +145,11 @@ class Gate(nn.Module):
         self.t = beta
 
     def forward(self, gate_input):
+        # Some market-derived features can still contain NaN after preprocessing
+        # (e.g., whole windows missing). Guard here to avoid poisoning softmax.
+        gate_input = torch.nan_to_num(gate_input, nan=0.0, posinf=0.0, neginf=0.0)
         output = self.trans(gate_input)
+        output = torch.nan_to_num(output, nan=0.0, posinf=0.0, neginf=0.0)
         output = torch.softmax(output / self.t, dim=-1)
         return self.d_output * output
 
@@ -182,6 +186,7 @@ class WaveFormer(nn.Module):
         self,
         d_feat: int,
         d_model: int,
+        output_dim: int,
         t_nhead: int,
         s_nhead: int,
         T_dropout_rate: float,
@@ -197,11 +202,17 @@ class WaveFormer(nn.Module):
         threshold_mode: str = "soft",
         threshold_scale: float = 0.3,
         denoise_blend: float = 0.25,
+        adaptive_blend: bool = False,
+        adaptive_target_ratio: float = 0.08,
+        adaptive_sharpness: float = 12.0,
+        adaptive_blend_min: float = 0.03,
+        adaptive_blend_max: float = 0.55,
         denoise_finest_only: bool = True,
         level_dependent_scale: bool = True,
         use_edge_pad: bool = True,
         use_boundary_smooth: bool = False,
         boundary_smooth_win: int = 1,
+        wavelet_collect_stats: bool = True,
     ):
         super(WaveFormer, self).__init__()
 
@@ -220,6 +231,11 @@ class WaveFormer(nn.Module):
                 threshold_mode=threshold_mode,
                 threshold_scale=threshold_scale,
                 denoise_blend=denoise_blend,
+                adaptive_blend=adaptive_blend,
+                adaptive_target_ratio=adaptive_target_ratio,
+                adaptive_sharpness=adaptive_sharpness,
+                adaptive_blend_min=adaptive_blend_min,
+                adaptive_blend_max=adaptive_blend_max,
                 denoise_finest_only=denoise_finest_only,
                 level_dependent_scale=level_dependent_scale,
                 use_edge_pad=use_edge_pad,
@@ -227,6 +243,7 @@ class WaveFormer(nn.Module):
                 boundary_smooth_win=boundary_smooth_win,
                 feature_start=0,
                 feature_end=gate_input_start_index,  # only factor features, not market info
+                collect_stats=wavelet_collect_stats,
             )
 
         self.layers = nn.Sequential(
@@ -235,7 +252,7 @@ class WaveFormer(nn.Module):
             TAttention(d_model=d_model, nhead=t_nhead, dropout=T_dropout_rate),
             SAttention(d_model=d_model, nhead=s_nhead, dropout=S_dropout_rate),
             TemporalAttention(d_model=d_model),
-            nn.Linear(d_model, 1),
+            nn.Linear(d_model, output_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -248,7 +265,16 @@ class WaveFormer(nn.Module):
             src = self.wavelet_denoiser(src)
 
         src = src * torch.unsqueeze(self.feature_gate(gate_input), dim=1)
-        return self.layers(src).squeeze(-1)
+        out = self.layers(src)
+        # Keep backward compatibility for single-head setting.
+        if out.shape[-1] == 1:
+            return out.squeeze(-1)
+        return out
+
+    def consume_runtime_stats(self) -> Optional[dict]:
+        if self.wavelet_denoiser is None:
+            return None
+        return self.wavelet_denoiser.consume_stats(reset=True)
 
 
 class WaveFormerModel(SequenceModel):
@@ -263,6 +289,9 @@ class WaveFormerModel(SequenceModel):
         T_dropout_rate: float,
         S_dropout_rate: float,
         beta: float,
+        num_label_heads: int = 1,
+        head_loss_weights=None,
+        primary_head_index: int = 0,
         # wavelet denoising (GPU-native, inside the model)
         use_wavelet_denoise: bool = False,
         wavelet: str = "haar",
@@ -271,16 +300,28 @@ class WaveFormerModel(SequenceModel):
         threshold_mode: str = "soft",
         threshold_scale: float = 0.3,
         denoise_blend: float = 0.25,
+        adaptive_blend: bool = False,
+        adaptive_target_ratio: float = 0.08,
+        adaptive_sharpness: float = 12.0,
+        adaptive_blend_min: float = 0.03,
+        adaptive_blend_max: float = 0.55,
         denoise_finest_only: bool = True,
         level_dependent_scale: bool = True,
         use_edge_pad: bool = True,
         use_boundary_smooth: bool = False,
         boundary_smooth_win: int = 1,
+        wavelet_collect_stats: bool = True,
         **kwargs,
     ):
-        super(WaveFormerModel, self).__init__(**kwargs)
+        super(WaveFormerModel, self).__init__(
+            num_label_heads=num_label_heads,
+            head_loss_weights=head_loss_weights,
+            primary_head_index=primary_head_index,
+            **kwargs,
+        )
         self.d_model = d_model
         self.d_feat = d_feat
+        self.num_label_heads = num_label_heads
         self.gate_input_start_index = gate_input_start_index
         self.gate_input_end_index = gate_input_end_index
         self.T_dropout_rate = T_dropout_rate
@@ -295,11 +336,17 @@ class WaveFormerModel(SequenceModel):
         self.threshold_mode = threshold_mode
         self.threshold_scale = threshold_scale
         self.denoise_blend = denoise_blend
+        self.adaptive_blend = adaptive_blend
+        self.adaptive_target_ratio = adaptive_target_ratio
+        self.adaptive_sharpness = adaptive_sharpness
+        self.adaptive_blend_min = adaptive_blend_min
+        self.adaptive_blend_max = adaptive_blend_max
         self.denoise_finest_only = denoise_finest_only
         self.level_dependent_scale = level_dependent_scale
         self.use_edge_pad = use_edge_pad
         self.use_boundary_smooth = use_boundary_smooth
         self.boundary_smooth_win = boundary_smooth_win
+        self.wavelet_collect_stats = wavelet_collect_stats
 
         self.init_model()
 
@@ -307,6 +354,7 @@ class WaveFormerModel(SequenceModel):
         self.model = WaveFormer(
             d_feat=self.d_feat,
             d_model=self.d_model,
+            output_dim=self.num_label_heads,
             t_nhead=self.t_nhead,
             s_nhead=self.s_nhead,
             T_dropout_rate=self.T_dropout_rate,
@@ -321,10 +369,16 @@ class WaveFormerModel(SequenceModel):
             threshold_mode=self.threshold_mode,
             threshold_scale=self.threshold_scale,
             denoise_blend=self.denoise_blend,
+            adaptive_blend=self.adaptive_blend,
+            adaptive_target_ratio=self.adaptive_target_ratio,
+            adaptive_sharpness=self.adaptive_sharpness,
+            adaptive_blend_min=self.adaptive_blend_min,
+            adaptive_blend_max=self.adaptive_blend_max,
             denoise_finest_only=self.denoise_finest_only,
             level_dependent_scale=self.level_dependent_scale,
             use_edge_pad=self.use_edge_pad,
             use_boundary_smooth=self.use_boundary_smooth,
             boundary_smooth_win=self.boundary_smooth_win,
+            wavelet_collect_stats=self.wavelet_collect_stats,
         )
         super(WaveFormerModel, self).init_model()

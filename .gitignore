@@ -1,17 +1,16 @@
-# Byte-compiled / optimized / DLL files
+# =============================================================================
+# WaveFormer 主仓库
+# qlib/ 为独立 Git 仓库（含自有 .gitignore），此处不纳入主仓库追踪
+# =============================================================================
+qlib/
+
+# =============================================================================
+# Python
+# =============================================================================
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
-#qlib
-qlib/
-*.tar.gz
-*.tar
-# 文档
-*.docx
-# Distribution / packaging
 .Python
 build/
 develop-eggs/
@@ -31,19 +30,15 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-
-# PyInstaller
-*.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
+__pypackages__/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.hypothesis/
 .tox/
 .nox/
+htmlcov/
 .coverage
 .coverage.*
 .cache
@@ -51,60 +46,14 @@ nosetests.xml
 coverage.xml
 *.cover
 *.py,cover
-.hypothesis/
-.pytest_cache/
-.mypy_cache/
-.dmypy.json
-dmypy.json
+test-output.xml
+.output
+.data
+tags
 
-# Translations
-*.mo
-*.pot
-
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-target/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-*.ipynb
-
-# IPython
-profile_default/
-ipython_config.py
-
-# pyenv
-.python-version
-
-# pipenv
-Pipfile.lock
-
-# PEP 582
-__pypackages__/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
+# =============================================================================
 # Environments
+# =============================================================================
 .env
 .venv
 env/
@@ -112,51 +61,60 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.python-version
+Pipfile.lock
 
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# IDEs
+# =============================================================================
+# IDEs & editors
+# =============================================================================
 .vscode/
 .idea/
+.spyderproject
+.spyproject
+.ropeproject
 *.swp
 *.swo
 *~
+.aider*
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
 
-# Data files
+# =============================================================================
+# Jupyter
+# =============================================================================
+.ipynb_checkpoints/
+*.ipynb
+
+# =============================================================================
+# Data & archives (local only)
+# =============================================================================
 *.pkl
 *.pickle
+*.hd5
 *.h5
 *.hdf5
 *.csv
 *.parquet
 *.feather
 *.zip
+*.tar
+*.tar.gz
 data/
+datasets/
 qlib-main/
 data/**/*.bin
 data/**/*.csv
 data/**/*.pkl
 data/**/*.h5
-datasets/
 
-# Model files
+# =============================================================================
+# Models & experiment outputs
+# =============================================================================
 *.ckpt
 *.pth
 *.pt
@@ -168,31 +126,43 @@ model/
 checkpoints/
 outputs/
 logs/
-
-# MLflow
 mlruns/
+wandb/
+tensorboard/
+runs/
 
-# Temporary files
+# =============================================================================
+# OS / crash / temp
+# =============================================================================
+core
+core.*
 *.tmp
 *.temp
 *.bak
-*.swp
-*.swo
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
 
-# OS files
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-
-# Project specific
-*.pkl
-*.hd5
-test-output.xml
-.output
-.data
-tags
-.aider*
+# =============================================================================
+# Docs / packaging extras
+# =============================================================================
+*.docx
+docs/_build/
+/site
+instance/
+.webassets-cache
+.scrapy
+target/
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+*.mo
+*.pot
+*.sage.py
+celerybeat-schedule
+celerybeat.pid
+profile_default/
+ipython_config.py
+.pyre/
